@@ -125,18 +125,26 @@ jobs:
           done
           test -n "$ADDR" || { echo "No ingress address yet"; exit 1; }
           echo "addr=$ADDR" >> "$GITHUB_OUTPUT"
-
-      - name: Render manifests (replace __ING_ADDR__)
+      - name: Render manifests (replace __ING_ADDR__ or {{ING_IP}})
         env:
           NS: ${{ steps.pick.outputs.env }}
           ADDR: ${{ steps.ing.outputs.addr }}
         run: |
           mkdir -p rendered
+          # Replace BOTH tokens to be safe:
           for f in scripts/manifests/${NS}-*.yaml; do
-            sed "s/__ING_ADDR__/${ADDR}/g" "$f" > "rendered/$(basename "$f")"
+            sed -e "s/{{ING_IP}}/${ADDR}/g" -e "s/__ING_ADDR__/${ADDR}/g" \
+                "$f" > "rendered/$(basename "$f")"
           done
           echo "Rendered:"
           ls -la rendered
+      - name: Show rendered ingress (first 50 lines)
+        env:
+          NS: ${{ steps.pick.outputs.env }}
+        run: |
+          echo "----- rendered/${NS}-ingress.yaml -----"
+          sed -n '1,50p' "rendered/${NS}-ingress.yaml" || true
+
 
       - name: Apply rendered manifests
         env:
