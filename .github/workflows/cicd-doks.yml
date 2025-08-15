@@ -1,0 +1,92 @@
+name: CI/CD to DOKS (DOCR)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
+
+jobs:
+  build_push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
+
+      - name: Login to DOCR
+        run: doctl registry login
+
+      - name: Build image
+        run: |
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest ./app
+
+      - name: Push image
+        run: |
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+
+  deploy:
+    needs: build_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
+
+      - name: Pick cluster (dev by default; override with workflow_dispatch)
+        id: pick
+        shell: bash
+        run: |
+          env_input='${{ github.event.inputs.target_env }}'
+          if [[ -z "$env_input" ]]; then env_input="dev"; fi
+          if [[ "$env_input" != "prod" ]]; then env_input="dev"; fi
+          echo "env=$env_input" >> $GITHUB_OUTPUT
+          if [[ -n "${{ github.event.inputs.target_cluster }}" ]]; then
+            echo "cluster=${{ github.event.inputs.target_cluster }}" >> $GITHUB_OUTPUT
+          else
+            if [[ "$env_input" == "prod" ]]; then
+              echo "cluster=${{ secrets.DO_CLUSTER_PROD }}" >> $GITHUB_OUTPUT
+            else
+              echo "cluster=${{ secrets.DO_CLUSTER_DEV }}" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Save kubeconfig for target cluster
+        run: doctl kubernetes cluster kubeconfig save "${{ steps.pick.outputs.cluster }}"
+
+      - name: Ensure namespace + DOCR pull secret
+        env:
+          REG: ${{ secrets.DOCR_REGISTRY }}
+        run: |
+          ns="${{ steps.pick.outputs.env }}"
+          kubectl create ns "$ns" --dry-run=client -o yaml | kubectl apply -f -
+          reg_name="$(basename "$REG")"
+          doctl registry kubernetes-manifest "$reg_name" --namespace "$ns" --name do-docr-secret | kubectl apply -f -
+
+      - name: Apply manifests
+        run: |
+          ns="${{ steps.pick.outputs.env }}"
+          kubectl apply -f scripts/manifests/ | true
+          kubectl apply -f scripts/manifests/${ns}-deploy.yaml
+          kubectl apply -f scripts/manifests/${ns}-svc.yaml
+          if [[ "$ns" == "dev" ]]; then kubectl apply -f scripts/manifests/${ns}-hpa.yaml; fi
+          kubectl apply -f scripts/manifests/${ns}-ingress.yaml
+
+      - name: Set image and wait for rollout
+        env:
+          IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
+        run: |
+          ns="${{ steps.pick.outputs.env }}"
+          kubectl -n "$ns" set image deployment/doks-flask app=$IMAGE:${{ github.sha }}
+          kubectl -n "$ns" rollout status deployment/doks-flask --timeout=300s
