@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doks-flask
+  namespace: prod
+  labels: { app: doks-flask }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: doks-flask }
+  template:
+    metadata:
+      labels: { app: doks-flask }
+    spec:
+      imagePullSecrets:
+        - name: do-docr-secret
+      containers:
+      - name: app
+        image: __APP_IMAGE__
+        ports: [{ containerPort: 8080, name: http }]
+        resources:
+          requests: { cpu: "150m", memory: "192Mi" }
+          limits:   { cpu: "600m", memory: "384Mi" }

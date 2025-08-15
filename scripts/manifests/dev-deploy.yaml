@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doks-flask-primary
+  namespace: dev
+  labels: { app: doks-flask }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: doks-flask, role: primary }
+  template:
+    metadata:
+      labels: { app: doks-flask, role: primary }
+    spec:
+      imagePullSecrets:
+        - name: do-docr-secret
+      containers:
+      - name: app
+        image: registry.digitalocean.com/dokr-saas/doks-flask:latest
+        ports: [{ containerPort: 8080, name: http }]
+        resources:
+          requests: { cpu: "100m", memory: "128Mi" }
+          limits:   { cpu: "500m", memory: "256Mi" }
