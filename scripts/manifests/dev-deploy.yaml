@@ -17,6 +17,7 @@ spec:
       containers:
       - name: app
         image: registry.digitalocean.com/dokr-saas/doks-flask:latest
+        imagePullPolicy: Always
         ports: [{ containerPort: 8080, name: http }]
         resources:
           requests: { cpu: "100m", memory: "128Mi" }

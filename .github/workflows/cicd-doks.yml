@@ -1,35 +1,22 @@
-name: CI/CD to DOKS (DOCR)
+name: CI/CD to DOKS (DOCR → Dev)
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
-    inputs:
-      target_env:
-        description: "Target environment (dev or prod)"
-        required: true
-        default: "dev"
-      target_cluster:
-        description: "Override cluster name (optional)"
-        required: false
-        default: ""
+  workflow_dispatch: {}
 
 env:
-  IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
+  APP_NAME: doks-flask
+  IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/doks-flask
 
 jobs:
-  build_push:
+  build_and_push:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate required secrets
-        run: |
-          test -n "${{ secrets.DO_TOKEN }}" || { echo "Missing DO_TOKEN"; exit 1; }
-          test -n "${{ secrets.DOCR_REGISTRY }}" || { echo "Missing DOCR_REGISTRY"; exit 1; }
-          test -n "${{ secrets.DOCR_REPO }}" || { echo "Missing DOCR_REPO"; exit 1; }
-          echo "IMAGE set (masked): ${IMAGE}"
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
@@ -39,157 +26,36 @@ jobs:
       - name: Login to DOCR
         run: doctl registry login
 
-      - name: Verify app build context
-        run: |
-          test -f ./app/Dockerfile || { echo "./app/Dockerfile not found"; exit 1; }
-          ls -la ./app
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
 
-      - name: Build image
-        run: |
-          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" ./app
+      - name: Set tag output
+        id: tag
+        run: echo "image=${{ github.sha }}" >> $GITHUB_OUTPUT
 
-      - name: Push image
-        run: |
-          docker push "$IMAGE:${{ github.sha }}"
-          docker push "$IMAGE:latest"
-
-  deploy:
-    needs: build_push
+  deploy_dev:
+    needs: build_and_push
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate required secrets
-        run: |
-          test -n "${{ secrets.DO_TOKEN }}" || { echo "Missing DO_TOKEN"; exit 1; }
-          test -n "${{ secrets.DOCR_REGISTRY }}" || { echo "Missing DOCR_REGISTRY"; exit 1; }
-          test -n "${{ secrets.DOCR_REPO }}" || { echo "Missing DOCR_REPO"; exit 1; }
-          test -n "${{ secrets.DO_CLUSTER_DEV }}" || { echo "Missing DO_CLUSTER_DEV"; exit 1; }
-          test -n "${{ secrets.DO_CLUSTER_PROD }}" || { echo "Missing DO_CLUSTER_PROD"; exit 1; }
-
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Pick env and cluster
-        id: pick
-        shell: bash
-        run: |
-          env_in="${{ github.event.inputs.target_env }}"
-          if [[ -z "$env_in" || "$env_in" != "prod" ]]; then env_in="dev"; fi
-          echo "env=$env_in" >> "$GITHUB_OUTPUT"
+      - name: Kubeconfig
+        run: doctl kubernetes cluster kubeconfig save "${{ secrets.DO_CLUSTER }}"
 
-          if [[ -n "${{ github.event.inputs.target_cluster }}" ]]; then
-            echo "cluster=${{ github.event.inputs.target_cluster }}" >> "$GITHUB_OUTPUT"
-          else
-            if [[ "$env_in" == "prod" ]]; then
-              echo "cluster=${{ secrets.DO_CLUSTER_PROD }}" >> "$GITHUB_OUTPUT"
-            else
-              echo "cluster=${{ secrets.DO_CLUSTER_DEV }}" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
-      - name: Guard cluster
-        run: |
-          [[ -n "${{ steps.pick.outputs.cluster }}" ]] || { echo "Cluster is empty"; exit 1; }
-          echo "Target env     : ${{ steps.pick.outputs.env }}"
-          echo "Target cluster : ${{ steps.pick.outputs.cluster }}"
-
-      - name: Save kubeconfig
-        run: doctl kubernetes cluster kubeconfig save "${{ steps.pick.outputs.cluster }}"
-
-      - name: Prepare namespace and DOCR pull secret
+      - name: Roll dev to new image
         env:
-          REG: ${{ secrets.DOCR_REGISTRY }}
+          IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/doks-flask
+          TAG:   ${{ github.sha }}
         run: |
-          ns="${{ steps.pick.outputs.env }}"
-          kubectl create ns "$ns" --dry-run=client -o yaml | kubectl apply -f -
-          reg_name="$(basename "$REG")"
-          doctl registry kubernetes-manifest "$reg_name" --namespace "$ns" --name do-docr-secret | kubectl apply -f -
-
-      - name: Resolve ingress address (ingress-nginx)
-        id: ing
-        shell: bash
-        run: |
-          for i in {1..60}; do
-            ADDR=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
-              -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' | tr -d ' ')
-            if [[ -n "$ADDR" ]]; then
-              echo "ADDR=$ADDR"
-              break
-            fi
-            echo "Waiting for ingress address... ($i/60)"
-            sleep 5
-          done
-          test -n "$ADDR" || { echo "No ingress address yet"; exit 1; }
-          echo "addr=$ADDR" >> "$GITHUB_OUTPUT"
-      - name: Render manifests (replace __ING_ADDR__ or {{ING_IP}})
-        env:
-          NS: ${{ steps.pick.outputs.env }}
-          ADDR: ${{ steps.ing.outputs.addr }}
-        run: |
-          mkdir -p rendered
-          # Replace BOTH tokens to be safe:
-          for f in scripts/manifests/${NS}-*.yaml; do
-            sed -e "s/{{ING_IP}}/${ADDR}/g" -e "s/__ING_ADDR__/${ADDR}/g" \
-                "$f" > "rendered/$(basename "$f")"
-          done
-          echo "Rendered:"
-          ls -la rendered
-      - name: Show rendered ingress (first 50 lines)
-        env:
-          NS: ${{ steps.pick.outputs.env }}
-        run: |
-          echo "----- rendered/${NS}-ingress.yaml -----"
-          sed -n '1,50p' "rendered/${NS}-ingress.yaml" || true
-
-
-      - name: Apply rendered manifests
-        env:
-          NS: ${{ steps.pick.outputs.env }}
-        run: |
-          kubectl apply -f rendered/${NS}-deploy.yaml
-          kubectl apply -f rendered/${NS}-svc.yaml
-          if [[ "$NS" == "dev" ]]; then kubectl apply -f rendered/${NS}-hpa.yaml; fi
-          kubectl apply -f rendered/${NS}-ingress.yaml
-
-      - name: Set image and wait for rollout (auto-detect deploy)
-        env:
-          IMAGE: ${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
-        shell: bash
-        run: |
-          ns="${{ steps.pick.outputs.env }}"
-
-          # Find a deployment with label app=doks-flask
-          DEPLOY=$(kubectl -n "$ns" get deploy -l app=doks-flask \
-            -o jsonpath='{.items[0].metadata.name}')
-
-          if [[ -z "$DEPLOY" ]]; then
-            echo "No Deployment found with label app=doks-flask in namespace '$ns'. Existing deployments:"
-            kubectl -n "$ns" get deploy -o wide
-            exit 1
-          fi
-
-          echo "Updating image on deployment/$DEPLOY in ns/$ns"
-          kubectl -n "$ns" set image "deployment/$DEPLOY" app="$IMAGE:${{ github.sha }}"
-          kubectl -n "$ns" rollout status "deployment/$DEPLOY" --timeout=300s
-
-      - name: Stamp version env (expose commit in response)
-        run: |
-          ns="${{ steps.pick.outputs.env }}"
-          DEPLOY=$(kubectl -n "$ns" get deploy -l app=doks-flask -o jsonpath='{.items[0].metadata.name}')
-          if [[ -z "$DEPLOY" ]]; then
-            echo "No deployment with label app=doks-flask found in ns=$ns"
-            kubectl -n "$ns" get deploy -o wide
-            exit 1
-          fi
-          kubectl -n "$ns" set env deploy/"$DEPLOY" APP_VERSION=${{ github.sha }}
-          kubectl -n "$ns" rollout status deploy/"$DEPLOY" --timeout=180s
-
-      - name: Output URLs
-        run: |
-          echo "Dev URL : http://dev.${{ steps.ing.outputs.addr }}.sslip.io/"
-          echo "Prod URL: http://app.${{ steps.ing.outputs.addr }}.sslip.io/"
-
+          set -e
+          kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
+          kubectl -n dev rollout status deployment/doks-flask --timeout=300s
