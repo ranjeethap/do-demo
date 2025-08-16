@@ -74,3 +74,10 @@ jobs:
           kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
           kubectl -n dev set env   deployment/doks-flask APP_VERSION- || true
           kubectl -n dev rollout status deployment/doks-flask --timeout=300s
+        - name: Debug docker auth
+        run: |
+          cat ~/.docker/config.json
+          echo
+          echo "Attempting docker login again (defensive)..."
+          doctl registry logout || true
+          doctl registry login
