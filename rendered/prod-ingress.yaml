@@ -2,18 +2,18 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: doks-flask
-  namespace: dev
+  namespace: prod
   annotations:
     kubernetes.io/ingress.class: nginx
 spec:
   rules:
-  - host: dev.__ING_ADDR__.sslip.io
+  - host: app.165.227.242.33.sslip.io
     http:
       paths:
       - path: /
         pathType: Prefix
         backend:
           service:
-            name: doks-flask
+            name: doks-flask-svc
             port:
               number: 80

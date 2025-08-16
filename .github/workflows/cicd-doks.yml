@@ -176,6 +176,17 @@ jobs:
           kubectl -n "$ns" set image "deployment/$DEPLOY" app="$IMAGE:${{ github.sha }}"
           kubectl -n "$ns" rollout status "deployment/$DEPLOY" --timeout=300s
 
+      - name: Stamp version env (expose commit in response)
+        run: |
+          ns="${{ steps.pick.outputs.env }}"
+          DEPLOY=$(kubectl -n "$ns" get deploy -l app=doks-flask -o jsonpath='{.items[0].metadata.name}')
+          if [[ -z "$DEPLOY" ]]; then
+            echo "No deployment with label app=doks-flask found in ns=$ns"
+            kubectl -n "$ns" get deploy -o wide
+            exit 1
+          fi
+          kubectl -n "$ns" set env deploy/"$DEPLOY" APP_VERSION=${{ github.sha }}
+          kubectl -n "$ns" rollout status deploy/"$DEPLOY" --timeout=180s
 
       - name: Output URLs
         run: |
