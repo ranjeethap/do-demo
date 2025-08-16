@@ -6,14 +6,13 @@ on:
   workflow_dispatch: {}
 
 env:
-  APP_NAME: doks-flask
-  IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/doks-flask
+  IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
 
 jobs:
   build_and_push:
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.tag.outputs.image }}
+      image_tag: ${{ steps.settag.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -23,21 +22,36 @@ jobs:
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Login to DOCR
-        run: doctl registry login
+      - name: Verify DO context & registry (debug)
+        run: |
+          set -e
+          echo "IMAGE=${IMAGE}"
+          # Show account/team (sanity)
+          doctl account get
+          # Show registry info; exit non-zero if missing
+          doctl registry get
+          # Show registry URL we expect to use
+          echo "Expecting: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/..."
+          # Login docker to DOCR
+          doctl registry login
+          # Confirm docker is logged in for DOCR
+          if ! grep -q "registry.digitalocean.com" ~/.docker/config.json; then
+            echo "ERROR: Docker not logged into DOCR"; cat ~/.docker/config.json; exit 1
+          fi
 
-      - name: Build & push
+      - name: Build & push (app/Dockerfile)
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:latest
 
-      - name: Set tag output
-        id: tag
-        run: echo "image=${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Set outputs
+        id: settag
+        run: echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
 
   deploy_dev:
     needs: build_and_push
@@ -48,14 +62,15 @@ jobs:
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Kubeconfig
+      - name: Kubeconfig (connect to your DOKS cluster)
         run: doctl kubernetes cluster kubeconfig save "${{ secrets.DO_CLUSTER }}"
 
-      - name: Roll dev to new image
+      - name: Roll dev to new image (no env stamping)
         env:
-          IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/doks-flask
-          TAG:   ${{ github.sha }}
+          IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
+          TAG:   ${{ needs.build_and_push.outputs.image_tag }}
         run: |
           set -e
           kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
+          kubectl -n dev set env   deployment/doks-flask APP_VERSION- || true
           kubectl -n dev rollout status deployment/doks-flask --timeout=300s
