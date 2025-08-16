@@ -22,28 +22,29 @@ jobs:
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Verify DO context & registry (debug)
+      - name: Verify DigitalOcean account & registry
         run: |
-          set -e
+          set -euo pipefail
           echo "IMAGE=${IMAGE}"
-          # Show account/team (sanity)
+          echo "=== doctl account get ==="
           doctl account get
-          # Show registry info; exit non-zero if missing
+          echo "=== doctl registry get ==="
           doctl registry get
-          # Show registry URL we expect to use
-          echo "Expecting: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/..."
-          # Login docker to DOCR
+
+      - name: Login to DOCR and verify docker auth
+        run: |
+          set -euo pipefail
           doctl registry login
-          # Confirm docker is logged in for DOCR
-          if ! grep -q "registry.digitalocean.com" ~/.docker/config.json; then
-            echo "ERROR: Docker not logged into DOCR"; cat ~/.docker/config.json; exit 1
-          fi
+          echo "=== ~/.docker/config.json (redacted) ==="
+          # show only the keys present; avoid printing any token
+          jq '.auths | keys' ~/.docker/config.json || cat ~/.docker/config.json
+          grep -q "registry.digitalocean.com" ~/.docker/config.json || { echo "DOCR login missing in docker config"; exit 1; }
 
       - name: Build & push (app/Dockerfile)
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./app/Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
@@ -62,22 +63,15 @@ jobs:
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Kubeconfig (connect to your DOKS cluster)
+      - name: Kubeconfig (connect to DOKS)
         run: doctl kubernetes cluster kubeconfig save "${{ secrets.DO_CLUSTER }}"
 
-      - name: Roll dev to new image (no env stamping)
+      - name: Roll dev to new image (image-only)
         env:
           IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
           TAG:   ${{ needs.build_and_push.outputs.image_tag }}
         run: |
-          set -e
+          set -euo pipefail
           kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
           kubectl -n dev set env   deployment/doks-flask APP_VERSION- || true
           kubectl -n dev rollout status deployment/doks-flask --timeout=300s
-        - name: Debug docker auth
-        run: |
-          cat ~/.docker/config.json
-          echo
-          echo "Attempting docker login again (defensive)..."
-          doctl registry logout || true
-          doctl registry login
