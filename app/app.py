@@ -2,7 +2,7 @@ from flask import Flask
 import os
 
 app = Flask(__name__)
-APP_VERSION = os.getenv("APP_VERSION", "v7")
+APP_VERSION = os.getenv("APP_VERSION", "Final Version")
 
 @app.get("/")
 def root():
