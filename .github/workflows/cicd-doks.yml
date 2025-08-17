@@ -12,33 +12,41 @@ jobs:
   build_and_push:
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.settag.outputs.sha }}
+      image_tag: ${{ steps.tag.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+
+      - name: Sanity check secrets
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ secrets.DO_TOKEN }}" ]]; then echo "DO_TOKEN is empty"; exit 1; fi
+          if [[ -z "${{ secrets.DOCR_REGISTRY }}" ]]; then echo "DOCR_REGISTRY is empty"; exit 1; fi
+          if [[ -z "${{ secrets.DOCR_REPO }}" ]]; then echo "DOCR_REPO is empty"; exit 1; fi
+          echo "IMAGE=${IMAGE}"
+          # Basic format check (lowercase and two segments after domain)
+          if ! [[ "${IMAGE}" =~ ^registry\.digitalocean\.com/[a-z0-9-]+/[a-z0-9-]+$ ]]; then
+            echo "IMAGE path malformed: ${IMAGE}"; exit 1;
+          fi
 
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Verify DigitalOcean account & registry
+      - name: Verify DO account & registry
         run: |
           set -euo pipefail
-          echo "IMAGE=${IMAGE}"
           echo "=== doctl account get ==="
           doctl account get
           echo "=== doctl registry get ==="
           doctl registry get
 
-      - name: Login to DOCR and verify docker auth
+      - name: Login to DigitalOcean Container Registry
         run: |
           set -euo pipefail
+          echo "Logging into DigitalOcean Container Registry..."
           doctl registry login
-          echo "=== ~/.docker/config.json (redacted) ==="
-          # show only the keys present; avoid printing any token
-          jq '.auths | keys' ~/.docker/config.json || cat ~/.docker/config.json
-          grep -q "registry.digitalocean.com" ~/.docker/config.json || { echo "DOCR login missing in docker config"; exit 1; }
 
       - name: Build & push (app/Dockerfile)
         uses: docker/build-push-action@v6
@@ -50,9 +58,9 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:latest
 
-      - name: Set outputs
-        id: settag
-        run: echo "sha=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+      - name: Expose tag
+        id: tag
+        run: echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
   deploy_dev:
     needs: build_and_push
@@ -63,15 +71,16 @@ jobs:
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Kubeconfig (connect to DOKS)
+      - name: Kubeconfig (DOKS)
         run: doctl kubernetes cluster kubeconfig save "${{ secrets.DO_CLUSTER }}"
 
-      - name: Roll dev to new image (image-only)
+      - name: Roll dev to new image
         env:
           IMAGE: registry.digitalocean.com/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}
           TAG:   ${{ needs.build_and_push.outputs.image_tag }}
         run: |
           set -euo pipefail
           kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
-          kubectl -n dev set env   deployment/doks-flask APP_VERSION- || true
+          # ensure no leftover APP_VERSION env overrides
+          kubectl -n dev set env deployment/doks-flask APP_VERSION- || true
           kubectl -n dev rollout status deployment/doks-flask --timeout=300s
