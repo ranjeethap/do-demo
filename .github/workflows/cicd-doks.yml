@@ -17,15 +17,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
-      - name: Sanity check secrets
+      - name: Sanity check secrets and IMAGE
         run: |
           set -euo pipefail
-          if [[ -z "${{ secrets.DO_TOKEN }}" ]]; then echo "DO_TOKEN is empty"; exit 1; fi
-          if [[ -z "${{ secrets.DOCR_REGISTRY }}" ]]; then echo "DOCR_REGISTRY is empty"; exit 1; fi
-          if [[ -z "${{ secrets.DOCR_REPO }}" ]]; then echo "DOCR_REPO is empty"; exit 1; fi
+          [[ -n "${{ secrets.DO_TOKEN }}" ]] || { echo "DO_TOKEN is empty"; exit 1; }
+          [[ -n "${{ secrets.DOCR_REGISTRY }}" ]] || { echo "DOCR_REGISTRY is empty"; exit 1; }
+          [[ -n "${{ secrets.DOCR_REPO }}"     ]] || { echo "DOCR_REPO is empty"; exit 1; }
           echo "IMAGE=${IMAGE}"
-          # Basic format check (lowercase and two segments after domain)
-          if ! [[ "${IMAGE}" =~ ^registry\.digitalocean\.com/[a-z0-9_-]+/[a-z0-9_-]+$ ]]; then
+          if ! [[ "${IMAGE}" =~ ^registry\.digitalocean\.com/[a-z0-9-]+/[a-z0-9-]+$ ]]; then
             echo "IMAGE path malformed: ${IMAGE}"; exit 1;
           fi
 
@@ -42,11 +41,15 @@ jobs:
           echo "=== doctl registry get ==="
           doctl registry get
 
-      - name: Login to DigitalOcean Container Registry
+      - name: Force Docker to use DOCR credentials
         run: |
           set -euo pipefail
-          echo "Logging into DigitalOcean Container Registry..."
-          doctl registry login
+          # Write Docker auth directly from doctl
+          doctl registry docker-config | tee "$HOME/.docker/config.json" > /dev/null
+          echo "=== Docker auth entries ==="
+          jq '.auths | keys' "$HOME/.docker/config.json"
+          grep -q "registry.digitalocean.com" "$HOME/.docker/config.json" \
+            || { echo "No DOCR creds in docker config"; exit 1; }
 
       - name: Build & push (app/Dockerfile)
         uses: docker/build-push-action@v6
@@ -81,6 +84,6 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
-          # ensure no leftover APP_VERSION env overrides
+          # make sure no leftover APP_VERSION env overrides mask your app text
           kubectl -n dev set env deployment/doks-flask APP_VERSION- || true
           kubectl -n dev rollout status deployment/doks-flask --timeout=300s
