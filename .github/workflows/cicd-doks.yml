@@ -8,22 +8,23 @@ on:
 env:
   IMAGE_REGISTRY: registry.digitalocean.com
   NS: dev
+  DEPLOYMENT: doks-flask
+  SERVICE: doks-flask
 
 jobs:
   build_push_deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Install doctl and authenticate with team token
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      # Sanity check secrets and registry visibility
-      - name: Preflight
+      - name: Preflight (secrets and registry)
         shell: bash
         run: |
           set -euo pipefail
@@ -35,7 +36,7 @@ jobs:
           if ! [[ "${IMAGE}" =~ ^registry\.digitalocean\.com/[a-z0-9-]+/[a-z0-9-]+$ ]]; then
             echo "Bad IMAGE path: ${IMAGE}"; exit 1;
           fi
-          # Must not error if token is correct and pointed at right team
+          # Confirm the registry is visible to this team token
           doctl registry get 1>/dev/null
 
       - name: Login to DOCR (write)
@@ -67,7 +68,6 @@ jobs:
           docker push "${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
           docker push "${{ steps.img.outputs.image }}:latest"
 
-      # Prepare kubeconfig from secret (no doctl required for kubectl)
       - name: Write kubeconfig
         shell: bash
         run: |
@@ -76,14 +76,13 @@ jobs:
           echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
           kubectl config current-context || true
 
-      # Ensure namespace and DOCR pull secret (from current docker creds)
-      - name: Ensure namespace and pull secret
+      - name: Ensure namespace and DOCR pull secret
         shell: bash
         run: |
           set -euo pipefail
           kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+          # Create a short-lived docker config from doctl for the pull secret
           mkdir -p "$HOME/.docker"
-          # Fresh short-lived docker config from doctl (write-capable)
           doctl registry docker-config --read-write --expiry-seconds 1800 > "$HOME/.docker/config.json"
           kubectl -n "${NS}" delete secret do-docr-secret >/dev/null 2>&1 || true
           kubectl -n "${NS}" create secret generic do-docr-secret \
@@ -92,73 +91,41 @@ jobs:
           kubectl -n "${NS}" patch serviceaccount default \
             -p '{"imagePullSecrets":[{"name":"do-docr-secret"}]}' || true
 
-      # Render minimal manifests referencing the pushed image
-      - name: Render manifests (dev)
+      - name: Deploy/Update app in DEV
         shell: bash
         run: |
           set -euo pipefail
           IMAGE="${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
-          cat > dev-deploy.yaml <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: doks-flask
-  namespace: ${NS}
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: doks-flask
-  template:
-    metadata:
-      labels:
-        app: doks-flask
-    spec:
-      imagePullSecrets:
-      - name: do-docr-secret
-      containers:
-      - name: app
-        image: ${IMAGE}
-        ports:
-        - containerPort: 8080
-        readinessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 3
-          periodSeconds: 5
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
-EOF
-          cat > dev-svc.yaml <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: doks-flask
-  namespace: ${NS}
-spec:
-  selector:
-    app: doks-flask
-  ports:
-  - port: 80
-    targetPort: 8080
-EOF
 
-      - name: Apply to dev and wait
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl apply -f dev-deploy.yaml
-          kubectl apply -f dev-svc.yaml
-          kubectl -n "${NS}" rollout status deploy/doks-flask --timeout=300s
+          # If deployment exists, set image; else create a minimal deployment
+          if kubectl -n "${NS}" get deploy "${DEPLOYMENT}" >/dev/null 2>&1; then
+            kubectl -n "${NS}" set image deploy/${DEPLOYMENT} app="${IMAGE}"
+          else
+            kubectl -n "${NS}" create deployment "${DEPLOYMENT}" \
+              --image="${IMAGE}" \
+              --port=8080
+            # Patch in readiness/liveness and pull secret quickly
+            kubectl -n "${NS}" patch deployment "${DEPLOYMENT}" --type='json' -p='[
+              {"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"do-docr-secret"}]},
+              {"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/healthz","port":8080},"initialDelaySeconds":3,"periodSeconds":5}},
+              {"op":"add","path":"/spec/template/spec/containers/0/livenessProbe","value":{"httpGet":{"path":"/healthz","port":8080},"initialDelaySeconds":10,"periodSeconds":10}}
+            ]'
+            kubectl -n "${NS}" scale deploy "${DEPLOYMENT}" --replicas=2
+          fi
+
+          # Ensure Service exists
+          if ! kubectl -n "${NS}" get svc "${SERVICE}" >/dev/null 2>&1; then
+            kubectl -n "${NS}" expose deployment "${DEPLOYMENT}" \
+              --name "${SERVICE}" \
+              --port 80 --target-port 8080
+          fi
+
+          # Wait for rollout
+          kubectl -n "${NS}" rollout status deploy/${DEPLOYMENT} --timeout=300s
 
       - name: Show running pods/images
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "${NS}" get pods -l app=doks-flask \
+          kubectl -n "${NS}" get pods -l app=${DEPLOYMENT} \
             -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].image}{"\n"}{end}'
