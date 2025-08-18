@@ -11,6 +11,8 @@ env:
 jobs:
   build_and_push:
     runs-on: ubuntu-latest
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/.docker  # 👈 force buildx to use this docker config
     outputs:
       image_tag: ${{ steps.tag.outputs.sha }}
     steps:
@@ -33,22 +35,24 @@ jobs:
         with:
           token: ${{ secrets.DO_TOKEN }}
 
-      - name: Verify DO account & registry
+      - name: Verify DO account & registry access
         run: |
           set -euo pipefail
           echo "=== doctl account get ==="
           doctl account get
           echo "=== doctl registry get ==="
           doctl registry get
+          echo "=== doctl registry repository list (may be empty on first push) ==="
+          doctl registry repository list || true
 
-      - name: Force Docker to use DOCR credentials
+      - name: Prepare DOCR auth (write docker config)
         run: |
           set -euo pipefail
-          # Write Docker auth directly from doctl
-          doctl registry docker-config | tee "$HOME/.docker/config.json" > /dev/null
-          echo "=== Docker auth entries ==="
-          jq '.auths | keys' "$HOME/.docker/config.json"
-          grep -q "registry.digitalocean.com" "$HOME/.docker/config.json" \
+          mkdir -p "$DOCKER_CONFIG"
+          doctl registry docker-config > "$DOCKER_CONFIG/config.json"
+          echo "Docker config at: $DOCKER_CONFIG/config.json"
+          cat "$DOCKER_CONFIG/config.json" | jq '.auths | keys'
+          grep -q "registry.digitalocean.com" "$DOCKER_CONFIG/config.json" \
             || { echo "No DOCR creds in docker config"; exit 1; }
 
       - name: Build & push (app/Dockerfile)
@@ -84,6 +88,5 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n dev set image deployment/doks-flask app="${IMAGE}:${TAG}"
-          # make sure no leftover APP_VERSION env overrides mask your app text
-          kubectl -n dev set env deployment/doks-flask APP_VERSION- || true
+          kubectl -n dev set env   deployment/doks-flask APP_VERSION- || true
           kubectl -n dev rollout status deployment/doks-flask --timeout=300s
