@@ -8,7 +8,7 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    app: doks-flask   # <— only this, no role=primary
+    app: doks-flask
   ports:
   - name: http
     port: 80

@@ -3,22 +3,35 @@ kind: Deployment
 metadata:
   name: doks-flask
   namespace: prod
-  labels: { app: doks-flask }
+  labels:
+    app: doks-flask
 spec:
   replicas: 3
   selector:
-    matchLabels: { app: doks-flask }
+    matchLabels:
+      app: doks-flask
   template:
     metadata:
-      labels: { app: doks-flask }
+      labels:
+        app: doks-flask
     spec:
       imagePullSecrets:
-        - name: do-docr-secret
+      - name: do-docr-secret
       containers:
       - name: app
-        image: __APP_IMAGE__
+        image: {{ APP_IMAGE }}:{{ TAG | default("latest") }}
         imagePullPolicy: Always
-        ports: [{ containerPort: 8080, name: http }]
-        resources:
-          requests: { cpu: "150m", memory: "192Mi" }
-          limits:   { cpu: "600m", memory: "384Mi" }
+        env:
+        - name: PORT
+          value: "8080"
+        ports:
+        - name: http
+          containerPort: 8080
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          initialDelaySeconds: 10
+          periodSeconds: 10

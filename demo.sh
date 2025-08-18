@@ -186,27 +186,62 @@ case "${1:-}" in
     ;;
 
   promote)
-    log "Promoting current DEV image to PROD"
-    [[ -f ./.ingress_addr ]] && source ./.ingress_addr
-    [[ -z "${ING_ADDR:-}" ]] && get_ingress_addr
-    render_manifests
-    ensure_namespace_and_pullsecret "$PROD_NS"
+  log "Promoting current DEV image to PROD"
 
-    # Read EXACT image from dev and promote it
-    DEV_DEPLOY=$(kubectl -n "$DEV_NS" get deploy -l app=doks-flask -o jsonpath='{.items[0].metadata.name}')
-    DEV_IMAGE=$(kubectl -n "$DEV_NS" get deploy "$DEV_DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].image}')
-    echo "Promoting image from dev: $DEV_IMAGE"
+  # make sure APP_IMAGE is set (from .env)
+  if [[ -z "${APP_IMAGE:-}" ]]; then
+    echo "APP_IMAGE not set (.env)."; exit 1;
+  fi
 
-    create_prod_deploy_if_missing "$DEV_IMAGE"
-    kubectl -n "$PROD_NS" set image deployment/doks-flask app="$DEV_IMAGE"
-    # Ensure no forced APP_VERSION in prod either
-    kubectl -n "$PROD_NS" set env deployment/doks-flask APP_VERSION- || true
+  # resolve a non-empty tag
+  # TAG_RESOLVED="$(resolve_tag)"
 
-    kubectl -n "$PROD_NS" rollout status deployment/doks-flask --timeout=300s
-    kubectl apply -f rendered/prod-ingress.yaml
-    urls
-    ;;
+  # Ensure TAG is never empty
+resolve_tag() {
+  if [[ -n "${TAG:-}" ]]; then
+    echo "$TAG"
+  elif [[ -n "${GITHUB_SHA:-}" ]]; then
+    echo "${GITHUB_SHA}"
+  else
+    echo "latest"
+  fi
+}
 
+# When rendering prod deploy, use a resolved non-empty tag
+render_manifests() {
+  mkdir -p rendered
+  local TAG_RESOLVED
+  TAG_RESOLVED="$(resolve_tag)"
+
+  # dev files are plain YAML (no templating)
+  cp scripts/manifests/dev-*.yaml rendered/
+
+  # prod templated deploy: replace placeholders safely
+  < scripts/manifests/prod-deploy.tmpl.yaml \
+    sed "s|{{ APP_IMAGE }}|${APP_IMAGE}|g" | \
+    sed "s|{{ TAG | default(\"latest\") }}|${TAG_RESOLVED}|g" \
+    > rendered/prod-deploy.tmpl.yaml
+
+  # prod svc/ingress are static
+  cp scripts/manifests/prod-svc.yaml rendered/
+  cp scripts/manifests/prod-ingress.yaml rendered/
+}
+
+# In 'up' path, do NOT apply any doks-flask-primary
+# Just apply the dev deploy/svc/hpa/ingress
+# ...
+# ensure pull secret + namespace
+  ensure_namespace_and_pullsecret "$PROD_NS"
+
+  # update image in prod (with resolved tag)
+  kubectl -n "$PROD_NS" set image deployment/doks-flask app="${APP_IMAGE}:${TAG_RESOLVED}"
+  kubectl -n "$PROD_NS" rollout status deployment/doks-flask --timeout=300s
+
+  # refresh ingress in case it changed
+  kubectl apply -f rendered/prod-ingress.yaml
+
+  urls
+  ;;
   status)
     if [[ -f ./.ingress_addr ]]; then
       # shellcheck disable=SC1091
