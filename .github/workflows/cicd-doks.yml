@@ -1,8 +1,8 @@
-name: CI/CD to DOKS via DOCR (no-doctl)
+name: CI/CD to DOKS (DOCR + kubectl)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   workflow_dispatch: {}
 
 env:
@@ -12,61 +12,98 @@ env:
 jobs:
   build_push_deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # --- Docker auth for DOCR (no DO API calls) ---
-      - name: Write Docker config (DOCR)
-        run: |
-          mkdir -p "$HOME/.docker"
-          echo '${{ secrets.DOCKER_CONFIG_JSON }}' > "$HOME/.docker/config.json"
-          # quick sanity: must have auths.registry.digitalocean.com
-          jq -e '.auths["registry.digitalocean.com"]' "$HOME/.docker/config.json" >/dev/null
+      # Install doctl and authenticate with team token
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
 
-      # --- Build & Push the image to DOCR ---
-      - name: Compute image name
-        id: img
+      # Sanity check secrets and registry visibility
+      - name: Preflight
+        shell: bash
         run: |
-          : "${{ secrets.DOCR_REGISTRY }}" "${{ secrets.DOCR_REPO }}"
-          IMAGE="${{ env.IMAGE_REGISTRY }}/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}"
+          set -euo pipefail
+          if [[ -z "${{ secrets.DOCR_REGISTRY }}" || -z "${{ secrets.DOCR_REPO }}" ]]; then
+            echo "DOCR_REGISTRY/DOCR_REPO secrets are missing"; exit 1;
+          fi
+          IMAGE="${IMAGE_REGISTRY}/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}"
+          echo "IMAGE=${IMAGE}"
+          if ! [[ "${IMAGE}" =~ ^registry\.digitalocean\.com/[a-z0-9-]+/[a-z0-9-]+$ ]]; then
+            echo "Bad IMAGE path: ${IMAGE}"; exit 1;
+          fi
+          # Must not error if token is correct and pointed at right team
+          doctl registry get 1>/dev/null
+
+      - name: Login to DOCR (write)
+        shell: bash
+        run: doctl registry login
+
+      - name: Compute image name/tags
+        id: img
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE_REGISTRY}/${{ secrets.DOCR_REGISTRY }}/${{ secrets.DOCR_REPO }}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "tag_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          # Optional friendly tag (date)
-          echo "tag_friendly=release-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
 
       - name: Build image
+        shell: bash
         run: |
-          docker build \
-            -f Dockerfile \
+          set -euo pipefail
+          docker build -f Dockerfile \
             -t "${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}" \
             -t "${{ steps.img.outputs.image }}:latest" \
             .
 
       - name: Push image
+        shell: bash
         run: |
+          set -euo pipefail
           docker push "${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
           docker push "${{ steps.img.outputs.image }}:latest"
 
-      # --- Kubeconfig from secret (no-doctl) ---
+      # Prepare kubeconfig from secret (no doctl required for kubectl)
       - name: Write kubeconfig
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$HOME/.kube"
           echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
-          # show current context (redacted)
           kubectl config current-context || true
 
-      # --- Deploy to DEV (apply manifests that reference :latest or ${GITHUB_SHA}) ---
-      - name: Render minimal manifests (dev)
+      # Ensure namespace and DOCR pull secret (from current docker creds)
+      - name: Ensure namespace and pull secret
+        shell: bash
         run: |
-          IMAGE="${{ steps.img.outputs.image }}"
-          cat > rendered-dev-deploy.yaml <<EOF
+          set -euo pipefail
+          kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+          mkdir -p "$HOME/.docker"
+          # Fresh short-lived docker config from doctl (write-capable)
+          doctl registry docker-config --read-write --expiry-seconds 1800 > "$HOME/.docker/config.json"
+          kubectl -n "${NS}" delete secret do-docr-secret >/dev/null 2>&1 || true
+          kubectl -n "${NS}" create secret generic do-docr-secret \
+            --type=kubernetes.io/dockerconfigjson \
+            --from-file=.dockerconfigjson="$HOME/.docker/config.json"
+          kubectl -n "${NS}" patch serviceaccount default \
+            -p '{"imagePullSecrets":[{"name":"do-docr-secret"}]}' || true
+
+      # Render minimal manifests referencing the pushed image
+      - name: Render manifests (dev)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
+          cat > dev-deploy.yaml <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: doks-flask
-  namespace: ${env:NS}
+  namespace: ${NS}
 spec:
   replicas: 2
   selector:
@@ -81,25 +118,28 @@ spec:
       - name: do-docr-secret
       containers:
       - name: app
-        image: ${IMAGE}:${{ steps.img.outputs.tag_sha }}
+        image: ${IMAGE}
         ports:
         - containerPort: 8080
         readinessProbe:
-          httpGet: { path: /healthz, port: 8080 }
+          httpGet:
+            path: /healthz
+            port: 8080
           initialDelaySeconds: 3
           periodSeconds: 5
         livenessProbe:
-          httpGet: { path: /healthz, port: 8080 }
+          httpGet:
+            path: /healthz
+            port: 8080
           initialDelaySeconds: 10
           periodSeconds: 10
 EOF
-
-          cat > rendered-dev-svc.yaml <<EOF
+          cat > dev-svc.yaml <<EOF
 apiVersion: v1
 kind: Service
 metadata:
   name: doks-flask
-  namespace: ${env:NS}
+  namespace: ${NS}
 spec:
   selector:
     app: doks-flask
@@ -108,33 +148,17 @@ spec:
     targetPort: 8080
 EOF
 
-      - name: Ensure namespace and DOCR pull secret
+      - name: Apply to dev and wait
+        shell: bash
         run: |
-          kubectl get ns "${{ env.NS }}" >/dev/null 2>&1 || kubectl create ns "${{ env.NS }}"
+          set -euo pipefail
+          kubectl apply -f dev-deploy.yaml
+          kubectl apply -f dev-svc.yaml
+          kubectl -n "${NS}" rollout status deploy/doks-flask --timeout=300s
 
-          # If you want to create the pull secret in CI without DO API calls,
-          # you can copy the Docker config into a k8s secret:
-          kubectl -n "${{ env.NS }}" delete secret do-docr-secret >/dev/null 2>&1 || true
-          kubectl -n "${{ env.NS }}" create secret generic do-docr-secret \
-            --type=kubernetes.io/dockerconfigjson \
-            --from-file=.dockerconfigjson="$HOME/.docker/config.json"
-
-          # Optional: make default SA use it
-          kubectl -n "${{ env.NS }}" patch serviceaccount default \
-            -p '{"imagePullSecrets":[{"name":"do-docr-secret"}]}' || true
-
-      - name: Apply DEV manifests
+      - name: Show running pods/images
+        shell: bash
         run: |
-          kubectl apply -f rendered-dev-deploy.yaml
-          kubectl apply -f rendered-dev-svc.yaml
-          kubectl rollout status -n "${{ env.NS }}" deploy/doks-flask --timeout=300s
-
-      # --- (Optional) Stamp APP_VERSION env to friendly tag ---
-      - name: Stamp friendly APP_VERSION (optional)
-        run: |
-          kubectl -n "${{ env.NS }}" set env deploy/doks-flask APP_VERSION="${{ steps.img.outputs.tag_friendly }}" || true
-
-      - name: Show running image
-        run: |
-          kubectl -n "${{ env.NS }}" get pods -l app=doks-flask \
+          set -euo pipefail
+          kubectl -n "${NS}" get pods -l app=doks-flask \
             -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].image}{"\n"}{end}'
