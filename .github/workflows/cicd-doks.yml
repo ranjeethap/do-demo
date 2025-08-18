@@ -68,7 +68,7 @@ jobs:
           docker push "${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
           docker push "${{ steps.img.outputs.image }}:latest"
 
-            - name: Write kubeconfig (robust)
+      - name: Write kubeconfig (robust)
         shell: bash
         run: |
           set -euo pipefail
