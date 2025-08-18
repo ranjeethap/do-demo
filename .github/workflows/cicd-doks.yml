@@ -48,19 +48,16 @@ jobs:
           echo "=== doctl registry get ==="
           doctl registry get || { echo "Registry not visible to token"; exit 1; }
 
-      - name: Probe DOCR write credentials (must return 200)
+      - name: Probe DOCR write credentials (must be 200)
         run: |
           set -euo pipefail
-          # If this 401s, the PAT is missing Container Registry write scope or belongs to the wrong team
           code=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: Bearer ${{ secrets.DO_TOKEN }}" \
             "https://api.digitalocean.com/v2/registry/docker-credentials?read_write=true&expiry_seconds=600")
           echo "docker-credentials(read_write=true) HTTP=$code"
           if [[ "$code" != "200" ]]; then
-            echo "Your DO_TOKEN does not have write scope to the Container Registry (or wrong team)."; exit 1;
+            echo "Token lacks DOCR write for this team (or wrong team selected when created)."; exit 1;
           fi
-
-
       - name: Prepare DOCR auth (write docker config)
         run: |
           set -euo pipefail
