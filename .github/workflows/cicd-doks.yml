@@ -98,19 +98,30 @@ jobs:
           set -euo pipefail
           IMAGE="${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
 
-          # If deployment exists, set image; else create a minimal deployment
+          # If deployment exists, discover the real container name; otherwise create it.
           if kubectl -n "${NS}" get deploy "${DEPLOYMENT}" >/dev/null 2>&1; then
-            kubectl -n "${NS}" set image deploy/${DEPLOYMENT} app="${IMAGE}"
+            # Get the current container name (first container)
+            CONTAINER=$(kubectl -n "${NS}" get deploy "${DEPLOYMENT}" -o jsonpath='{.spec.template.spec.containers[0].name}')
+            echo "Updating image for container '${CONTAINER}' in deployment '${DEPLOYMENT}'"
+            kubectl -n "${NS}" set image "deploy/${DEPLOYMENT}" "${CONTAINER}=${IMAGE}"
           else
+            echo "Creating deployment '${DEPLOYMENT}' with image ${IMAGE}"
             kubectl -n "${NS}" create deployment "${DEPLOYMENT}" \
               --image="${IMAGE}" \
               --port=8080
-            # Patch in readiness/liveness and pull secret quickly
+
+            # Normalize container name to 'app' so future updates can always target 'app'
+            kubectl -n "${NS}" patch deployment "${DEPLOYMENT}" --type='json' -p='[
+              {"op":"replace","path":"/spec/template/spec/containers/0/name","value":"app"}
+            ]'
+
+            # Add pull secret + probes
             kubectl -n "${NS}" patch deployment "${DEPLOYMENT}" --type='json' -p='[
               {"op":"add","path":"/spec/template/spec/imagePullSecrets","value":[{"name":"do-docr-secret"}]},
               {"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/healthz","port":8080},"initialDelaySeconds":3,"periodSeconds":5}},
               {"op":"add","path":"/spec/template/spec/containers/0/livenessProbe","value":{"httpGet":{"path":"/healthz","port":8080},"initialDelaySeconds":10,"periodSeconds":10}}
             ]'
+
             kubectl -n "${NS}" scale deploy "${DEPLOYMENT}" --replicas=2
           fi
 
@@ -122,8 +133,11 @@ jobs:
           fi
 
           # Wait for rollout
-          kubectl -n "${NS}" rollout status deploy/${DEPLOYMENT} --timeout=300s
+          kubectl -n "${NS}" rollout status "deploy/${DEPLOYMENT}" --timeout=300s
 
+          # Show current pods and images
+          kubectl -n "${NS}" get pods -l app="${DEPLOYMENT}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].name}{" = "}{.spec.containers[0].image}{"\n"}{end}'
       - name: Show running pods/images
         shell: bash
         run: |
