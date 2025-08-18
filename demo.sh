@@ -5,7 +5,7 @@ set -euo pipefail
 # Demo driver for DOKS + DOCR + Ingress + HPA + Promote to Prod
 # ------------------------------------------------------------
 
-# Optional .env
+# Optional .env (e.g. APP_IMAGE=registry.digitalocean.com/<registry>/<repo>)
 if [[ -f .env ]]; then
   # shellcheck disable=SC1091
   set -a; source ./.env; set +a
@@ -62,7 +62,7 @@ render_manifests() {
         "$f" > "$out_dir/$base"
   done
 
-  # also copy prod-deploy.tmpl.yaml (we'll substitute during promote if needed)
+  # copy prod-deploy template as-is (image replaced at promote time)
   if [[ -f scripts/manifests/prod-deploy.tmpl.yaml ]]; then
     cp scripts/manifests/prod-deploy.tmpl.yaml "$out_dir/prod-deploy.tmpl.yaml"
   fi
@@ -80,6 +80,11 @@ ensure_namespace_and_pullsecret() {
 
   kubectl create ns "$ns" --dry-run=client -o yaml | kubectl apply -f -
   doctl registry kubernetes-manifest "$reg_name" --namespace "$ns" --name do-docr-secret | kubectl apply -f -
+
+  # Make default SA use the pull secret implicitly
+  kubectl -n "$ns" patch serviceaccount default \
+    --type merge \
+    -p '{"imagePullSecrets":[{"name":"do-docr-secret"}]}' >/dev/null 2>&1 || true
 }
 
 wait_ready_if_script() {
@@ -99,7 +104,7 @@ deploy_dev() {
   kubectl apply -f rendered/dev-hpa.yaml || true
   kubectl apply -f rendered/dev-ingress.yaml
 
-  # Set image on the actual deployment that serves traffic
+  # Detect the actual deployment name (label-based)
   local deploy
   deploy="$(kubectl -n "$ns" get deploy -l app=doks-flask -o jsonpath='{.items[0].metadata.name}')"
   if [[ -z "$deploy" ]]; then
@@ -107,8 +112,12 @@ deploy_dev() {
     kubectl -n "$ns" get deploy -o wide
     exit 1
   fi
+
+  # Deploy the requested image; do not set APP_VERSION env (let app.py decide)
   kubectl -n "$ns" set image "deployment/$deploy" app="$APP_IMAGE:${TAG:-latest}"
-  kubectl -n "$ns" set env "deployment/$deploy" APP_VERSION-   # <--- ensure no leftover override
+  # Ensure no stray APP_VERSION forced at the deployment level
+  kubectl -n "$ns" set env "deployment/$deploy" APP_VERSION- || true
+
   kubectl -n "$ns" rollout status "deployment/$deploy" --timeout=300s
 }
 
@@ -183,19 +192,18 @@ case "${1:-}" in
     render_manifests
     ensure_namespace_and_pullsecret "$PROD_NS"
 
-    # Read EXACT image from dev
+    # Read EXACT image from dev and promote it
     DEV_DEPLOY=$(kubectl -n "$DEV_NS" get deploy -l app=doks-flask -o jsonpath='{.items[0].metadata.name}')
     DEV_IMAGE=$(kubectl -n "$DEV_NS" get deploy "$DEV_DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].image}')
     echo "Promoting image from dev: $DEV_IMAGE"
 
-    # Create prod deploy if missing, otherwise update image
     create_prod_deploy_if_missing "$DEV_IMAGE"
     kubectl -n "$PROD_NS" set image deployment/doks-flask app="$DEV_IMAGE"
+    # Ensure no forced APP_VERSION in prod either
+    kubectl -n "$PROD_NS" set env deployment/doks-flask APP_VERSION- || true
+
     kubectl -n "$PROD_NS" rollout status deployment/doks-flask --timeout=300s
-
-    # Ensure ingress present (already rendered)
     kubectl apply -f rendered/prod-ingress.yaml
-
     urls
     ;;
 
@@ -232,6 +240,11 @@ case "${1:-}" in
   *)
     cat <<'USAGE'
 Usage: ./demo.sh {up|promote|status|down}
+
+Tip:
+- Edit app/app.py message locally, build&push image to DOCR, then:
+    ./demo.sh up        # deploy/update dev and base prod
+    ./demo.sh promote   # roll the exact dev image to prod
 USAGE
     exit 1
     ;;
