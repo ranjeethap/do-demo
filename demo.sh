@@ -2,285 +2,209 @@
 set -euo pipefail
 
 # ------------------------------------------------------------
-# Demo driver for DOKS + DOCR + Ingress + HPA + Promote to Prod
+# Config (override via .env or environment variables)
 # ------------------------------------------------------------
+DEV_NS="${DEV_NS:-dev}"
+PROD_NS="${PROD_NS:-prod}"
+APP_NAME="${APP_NAME:-doks-flask}"
+APP_IMAGE="${APP_IMAGE:-}"        # optional; CI will set it, local builds can set too
+REGISTRY_NAME="${REGISTRY_NAME:-dokr-saas}"  # DOCR registry name (for secrets)
+PULL_SECRET_NAME="${PULL_SECRET_NAME:-do-docr-secret}"
 
-# Optional .env (e.g. APP_IMAGE=registry.digitalocean.com/<registry>/<repo>)
+# Load optional .env sitting next to this script
 if [[ -f .env ]]; then
   # shellcheck disable=SC1091
-  set -a; source ./.env; set +a
+  source .env
 fi
 
-# --- Defaults (override via env or .env) ---
-: "${APP_IMAGE:=registry.digitalocean.com/dokr-saas/doks-flask}"   # DOCR image
-: "${DEV_NS:=dev}"
-: "${PROD_NS:=prod}"
-: "${ING_NS:=ingress-nginx}"
-: "${ING_SVC:=ingress-nginx-controller}"
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+log() { printf "\n=== %s ===\n" "$*"; }
+err() { printf "\n[ERROR] %s\n" "$*" >&2; }
+here() { cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1; pwd; }
 
-# Derive DOCR_REGISTRY (e.g., registry.digitalocean.com/dokr-saas) from APP_IMAGE if not set
-if [[ -z "${DOCR_REGISTRY:-}" ]]; then
-  DOCR_REGISTRY="$(echo "$APP_IMAGE" | awk -F/ '{print $1"/"$2}')"
-fi
-
-# --- Utilities ---
-log() { printf "\n=== %s ===\n" "$*" >&2; }
-
+# Get current NGINX Ingress Controller external IP and persist it to ./.ingress_addr
 get_ingress_addr() {
-  log "Waiting for external address of ${ING_NS}/${ING_SVC} ..."
-  for i in {1..60}; do
-    local addr
-    addr="$(kubectl -n "$ING_NS" get svc "$ING_SVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' | tr -d ' ')"
-    if [[ -n "$addr" ]]; then
-      export ING_ADDR="$addr"
-      printf 'export ING_ADDR=%s\n' "$addr" > ./.ingress_addr
-      log "Found ingress address: $ING_ADDR"
-      return 0
-    fi
-    sleep 5
-  done
-  echo "ERROR: Ingress external address not ready." >&2
-  exit 1
-}
-
-render_manifests() {
-  # Render __ING_ADDR__ into dev/prod ingress manifests
-  local out_dir="rendered"
-  mkdir -p "$out_dir"
-
-  if [[ -z "${ING_ADDR:-}" ]]; then
-    echo "ING_ADDR not set; call get_ingress_addr first." >&2
+  local ip
+  ip=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  if [[ -z "${ip}" ]]; then
+    err "No external IP on ingress-nginx/ingress-nginx-controller yet. Wait until it is provisioned."
     exit 1
   fi
-
-  rm -f "$out_dir"/dev-*.yaml "$out_dir"/prod-*.yaml 2>/dev/null || true
-
-  for f in scripts/manifests/dev-*.yaml scripts/manifests/prod-*.yaml; do
-    [[ -f "$f" ]] || continue
-    local base; base="$(basename "$f")"
-    sed -e "s/__ING_ADDR__/${ING_ADDR}/g" -e "s/{{ING_IP}}/${ING_ADDR}/g" \
-        "$f" > "$out_dir/$base"
-  done
-
-  # copy prod-deploy template as-is (image replaced at promote time)
-  if [[ -f scripts/manifests/prod-deploy.tmpl.yaml ]]; then
-    cp scripts/manifests/prod-deploy.tmpl.yaml "$out_dir/prod-deploy.tmpl.yaml"
-  fi
-
-  if [[ "${VERBOSE:-0}" == "1" ]]; then
-    echo "Rendered manifests written to $out_dir/:"
-    ls -la "$out_dir"
-  fi
+  export ING_ADDR="$ip"
+  printf 'ING_ADDR=%s\n' "$ING_ADDR" > ./.ingress_addr
+  echo "Saved to ./.ingress_addr"
+  echo "To use in your shell:  source ./.ingress_addr"
 }
 
+# Render manifests by substituting __ING_ADDR__ with current ingress IP
+render_manifests() {
+  if [[ -f ./.ingress_addr ]]; then
+    # shellcheck disable=SC1091
+    source ./.ingress_addr
+  fi
+  if [[ -z "${ING_ADDR:-}" ]]; then
+    get_ingress_addr
+  fi
+  mkdir -p rendered
+  sed "s/__ING_ADDR__/${ING_ADDR}/g" scripts/manifests/dev-ingress.yaml  > rendered/dev-ingress.yaml
+  sed "s/__ING_ADDR__/${ING_ADDR}/g" scripts/manifests/prod-ingress.yaml > rendered/prod-ingress.yaml
+  cp scripts/manifests/dev-deploy.yaml          rendered/dev-deploy.yaml
+  cp scripts/manifests/dev-svc.yaml             rendered/dev-svc.yaml
+  cp scripts/manifests/dev-hpa.yaml             rendered/dev-hpa.yaml
+  cp scripts/manifests/prod-deploy.tmpl.yaml    rendered/prod-deploy.tmpl.yaml
+  cp scripts/manifests/prod-svc.yaml            rendered/prod-svc.yaml
+  log "Rendered manifests written to rendered/:"
+  ls -la rendered
+}
+
+# Create namespace and ensure a DOCR imagePullSecret exists (requires you to be logged in with doctl)
 ensure_namespace_and_pullsecret() {
   local ns="$1"
-  local reg_name
-  reg_name="$(basename "$DOCR_REGISTRY")"
+  kubectl get ns "$ns" >/dev/null 2>&1 || kubectl create ns "$ns" >/dev/null
 
-  kubectl create ns "$ns" --dry-run=client -o yaml | kubectl apply -f -
-  doctl registry kubernetes-manifest "$reg_name" --namespace "$ns" --name do-docr-secret | kubectl apply -f -
-
-  # Make default SA use the pull secret implicitly
-  kubectl -n "$ns" patch serviceaccount default \
-    --type merge \
-    -p '{"imagePullSecrets":[{"name":"do-docr-secret"}]}' >/dev/null 2>&1 || true
-}
-
-wait_ready_if_script() {
-  if [[ -x scripts/wait-ready.sh ]]; then
-    ./scripts/wait-ready.sh "$@"
-  fi
-}
-
-deploy_dev() {
-  local ns="$DEV_NS"
-  log "Deploying to namespace '$ns'"
-
-  ensure_namespace_and_pullsecret "$ns"
-
-  kubectl apply -f rendered/dev-deploy.yaml
-  kubectl apply -f rendered/dev-svc.yaml
-  kubectl apply -f rendered/dev-hpa.yaml || true
-  kubectl apply -f rendered/dev-ingress.yaml
-
-  # Detect the actual deployment name (label-based)
-  local deploy
-  deploy="$(kubectl -n "$ns" get deploy -l app=doks-flask -o jsonpath='{.items[0].metadata.name}')"
-  if [[ -z "$deploy" ]]; then
-    echo "ERROR: No deployment with label app=doks-flask in ns=$ns" >&2
-    kubectl -n "$ns" get deploy -o wide
-    exit 1
-  fi
-
-  # Deploy the requested image; do not set APP_VERSION env (let app.py decide)
-  kubectl -n "$ns" set image "deployment/$deploy" app="$APP_IMAGE:${TAG:-latest}"
-  # Ensure no stray APP_VERSION forced at the deployment level
-  kubectl -n "$ns" set env "deployment/$deploy" APP_VERSION- || true
-
-  kubectl -n "$ns" rollout status "deployment/$deploy" --timeout=300s
-}
-
-deploy_prod_basics() {
-  local ns="$PROD_NS"
-  log "Deploying base services/ingress to namespace '$ns'"
-
-  ensure_namespace_and_pullsecret "$ns"
-  kubectl apply -f rendered/prod-svc.yaml
-  kubectl apply -f rendered/prod-ingress.yaml
-}
-
-create_prod_deploy_if_missing() {
-  local ns="$PROD_NS" image="$1"
-  if ! kubectl -n "$ns" get deploy doks-flask >/dev/null 2>&1; then
-    log "Prod deployment not found; creating from template with image: $image"
-    if [[ -f rendered/prod-deploy.tmpl.yaml ]]; then
-      sed "s#__APP_IMAGE__#${image}#g" rendered/prod-deploy.tmpl.yaml | kubectl apply -f -
+  log "Creating DOCR imagePullSecret in namespace '$ns' (registry: ${REGISTRY_NAME})"
+  # Prefer doctl to produce a fresh dockerconfig (short-lived)
+  if command -v doctl >/dev/null 2>&1; then
+    tmp_docker_cfg="$(mktemp)"
+    doctl registry docker-config --read-write --expiry-seconds 1800 > "$tmp_docker_cfg"
+    kubectl -n "$ns" delete secret "${PULL_SECRET_NAME}" >/dev/null 2>&1 || true
+    kubectl -n "$ns" create secret generic "${PULL_SECRET_NAME}" \
+      --type=kubernetes.io/dockerconfigjson \
+      --from-file=.dockerconfigjson="$tmp_docker_cfg" >/dev/null
+    rm -f "$tmp_docker_cfg"
+  else
+    # Fallback: if user logged in with docker already, reuse local docker config
+    if [[ -f "$HOME/.docker/config.json" ]]; then
+      kubectl -n "$ns" delete secret "${PULL_SECRET_NAME}" >/dev/null 2>&1 || true
+      kubectl -n "$ns" create secret generic "${PULL_SECRET_NAME}" \
+        --type=kubernetes.io/dockerconfigjson \
+        --from-file=.dockerconfigjson="$HOME/.docker/config.json" >/dev/null
     else
-      # Minimal fallback (if template missing)
-      cat <<EOF | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: doks-flask
-  namespace: ${ns}
-  labels: { app: doks-flask }
-spec:
-  replicas: 3
-  selector: { matchLabels: { app: doks-flask } }
-  template:
-    metadata: { labels: { app: doks-flask } }
-    spec:
-      imagePullSecrets:
-      - name: do-docr-secret
-      containers:
-      - name: app
-        image: ${image}
-        imagePullPolicy: Always
-        ports: [{ containerPort: 8080, name: http }]
-        resources:
-          requests: { cpu: "150m", memory: "192Mi" }
-          limits:   { cpu: "600m", memory: "384Mi" }
-EOF
+      err "Neither doctl nor a local docker config found to create image pull secret."
+      exit 1
     fi
   fi
+
+  # Patch default service account to use imagePullSecret by default
+  kubectl -n "$ns" patch serviceaccount default \
+    -p "{\"imagePullSecrets\":[{\"name\":\"${PULL_SECRET_NAME}\"}]}" >/dev/null || true
 }
 
 urls() {
+  if [[ -f ./.ingress_addr ]]; then
+    # shellcheck disable=SC1091
+    source ./.ingress_addr
+  fi
+  if [[ -z "${ING_ADDR:-}" ]]; then
+    get_ingress_addr
+  fi
   echo "Dev URL : http://dev.${ING_ADDR}.sslip.io/"
   echo "Prod URL: http://app.${ING_ADDR}.sslip.io/"
 }
 
+# ------------------------------------------------------------
+# Actions
+# ------------------------------------------------------------
 case "${1:-}" in
   up)
     log "Bringing up demo stack"
-    if [[ -x scripts/addons-helm.sh ]]; then
-      scripts/addons-helm.sh
-    fi
+
+    # 1) Render manifests with live ingress IP
     get_ingress_addr
     render_manifests
-    deploy_dev
-    deploy_prod_basics
-    wait_ready_if_script
+
+    # 2) Ensure DOCR pull secret in dev/prod
+    ensure_namespace_and_pullsecret "$DEV_NS"
+    ensure_namespace_and_pullsecret "$PROD_NS"
+
+    # 3) Deploy Dev (Deployment/Service/HPA/Ingress)
+    kubectl apply -f rendered/dev-deploy.yaml
+    kubectl apply -f rendered/dev-svc.yaml
+    kubectl apply -f rendered/dev-hpa.yaml
+    kubectl apply -f rendered/dev-ingress.yaml
+
+    # 4) Deploy Prod (Deployment template gets created by CI or by promote,
+    #    but we put Service + Ingress to be ready)
+    # If you already maintain a prod deployment, skip templated apply here.
+    kubectl apply -f rendered/prod-svc.yaml
+    kubectl apply -f rendered/prod-ingress.yaml || true
+
     urls
     ;;
 
   promote)
-  log "Promoting current DEV image to PROD"
+    log "Promoting current DEV image to PROD"
 
-  # make sure APP_IMAGE is set (from .env)
-  if [[ -z "${APP_IMAGE:-}" ]]; then
-    echo "APP_IMAGE not set (.env)."; exit 1;
-  fi
-
-  # resolve a non-empty tag
-  # TAG_RESOLVED="$(resolve_tag)"
-
-  # Ensure TAG is never empty
-resolve_tag() {
-  if [[ -n "${TAG:-}" ]]; then
-    echo "$TAG"
-  elif [[ -n "${GITHUB_SHA:-}" ]]; then
-    echo "${GITHUB_SHA}"
-  else
-    echo "latest"
-  fi
-}
-
-# When rendering prod deploy, use a resolved non-empty tag
-render_manifests() {
-  mkdir -p rendered
-  local TAG_RESOLVED
-  TAG_RESOLVED="$(resolve_tag)"
-
-  # dev files are plain YAML (no templating)
-  cp scripts/manifests/dev-*.yaml rendered/
-
-  # prod templated deploy: replace placeholders safely
-  < scripts/manifests/prod-deploy.tmpl.yaml \
-    sed "s|{{ APP_IMAGE }}|${APP_IMAGE}|g" | \
-    sed "s|{{ TAG | default(\"latest\") }}|${TAG_RESOLVED}|g" \
-    > rendered/prod-deploy.tmpl.yaml
-
-  # prod svc/ingress are static
-  cp scripts/manifests/prod-svc.yaml rendered/
-  cp scripts/manifests/prod-ingress.yaml rendered/
-}
-
-# In 'up' path, do NOT apply any doks-flask-primary
-# Just apply the dev deploy/svc/hpa/ingress
-# ...
-# ensure pull secret + namespace
-  ensure_namespace_and_pullsecret "$PROD_NS"
-
-  # update image in prod (with resolved tag)
-  kubectl -n "$PROD_NS" set image deployment/doks-flask app="${APP_IMAGE}:${TAG_RESOLVED}"
-  kubectl -n "$PROD_NS" rollout status deployment/doks-flask --timeout=300s
-
-  # refresh ingress in case it changed
-  kubectl apply -f rendered/prod-ingress.yaml
-
-  urls
-  ;;
-  status)
+    # Make sure we have ingress IP (for printing URLs; not required for set image)
     if [[ -f ./.ingress_addr ]]; then
       # shellcheck disable=SC1091
       source ./.ingress_addr
-    else
+    fi
+    if [[ -z "${ING_ADDR:-}" ]]; then
       get_ingress_addr
     fi
 
-    log "Dev status"
-    kubectl -n "$DEV_NS" get deploy,svc,ing
+    # Re-render prod ingress (in case IP changed)
+    render_manifests
+    ensure_namespace_and_pullsecret "$PROD_NS"
+
+    # Read the exact image used in dev (container name: app)
+    DEV_IMAGE=$(kubectl -n "$DEV_NS" get deploy/"$APP_NAME" \
+      -o jsonpath='{.spec.template.spec.containers[?(@.name=="app")].image}')
+
+    if [[ -z "$DEV_IMAGE" ]]; then
+      err "Could not resolve image from dev deployment '$APP_NAME'. Aborting."
+      exit 1
+    fi
+    log "Promoting image: $DEV_IMAGE"
+
+    # Update prod deployment to use same image and wait for rollout
+    kubectl -n "$PROD_NS" set image deployment/"$APP_NAME" app="$DEV_IMAGE" --record
+    kubectl -n "$PROD_NS" rollout status deployment/"$APP_NAME" --timeout=300s
+
+    # Re-apply prod ingress (just in case)
+    kubectl apply -f rendered/prod-ingress.yaml
+
+    urls
+    ;;
+
+  status)
+    log "Status: images and endpoints"
+    echo "[DEV]"
+    kubectl -n "$DEV_NS" get deploy,svc,ingress -l app="$APP_NAME" -o wide
     echo
-    log "Prod status"
-    kubectl -n "$PROD_NS" get deploy,svc,ing
-    echo
-    log "Live images (dev)"
-    kubectl -n "$DEV_NS" get pods -l app=doks-flask -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].image}{"\n"}{end}' || true
-    echo
-    log "Live images (prod)"
-    kubectl -n "$PROD_NS" get pods -l app=doks-flask -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.containers[0].image}{"\n"}{end}' || true
-    echo
+    echo "[PROD]"
+    kubectl -n "$PROD_NS" get deploy,svc,ingress -l app="$APP_NAME" -o wide
     urls
     ;;
 
   down)
-    log "Tearing down demo resources (namespaces: $DEV_NS, $PROD_NS)"
-    kubectl -n "$DEV_NS" delete deploy,svc,ing,hpa -l app=doks-flask --ignore-not-found
-    kubectl -n "$PROD_NS" delete deploy,svc,ing -l app=doks-flask --ignore-not-found
-    echo "Done. Run './demo.sh up' to recreate."
+    log "Tearing down app resources (not deleting cluster)"
+    kubectl -n "$DEV_NS" delete deploy,svc,ingress,hpa -l app="$APP_NAME" --ignore-not-found
+    kubectl -n "$PROD_NS" delete deploy,svc,ingress,hpa -l app="$APP_NAME" --ignore-not-found
+    echo "Note: namespaces, ingress controller, and cluster remain."
     ;;
 
   *)
-    cat <<'USAGE'
-Usage: ./demo.sh {up|promote|status|down}
+    cat <<EOF
+Usage: $0 {up|promote|status|down}
 
-Tip:
-- Edit app/app.py message locally, build&push image to DOCR, then:
-    ./demo.sh up        # deploy/update dev and base prod
-    ./demo.sh promote   # roll the exact dev image to prod
-USAGE
+  up       - Render Ingress from live IP, ensure DOCR pull-secrets, deploy dev (deploy/svc/hpa/ingress) and prod (svc/ingress).
+  promote  - Copy the exact image from dev deployment and roll it out to prod. Re-renders prod Ingress and prints URLs.
+  status   - Show dev/prod deployments, services, ingress and print access URLs.
+  down     - Delete dev/prod app resources (keeps namespaces and cluster).
+
+Environment (override via .env or inline):
+  DEV_NS            (default: dev)
+  PROD_NS           (default: prod)
+  APP_NAME          (default: doks-flask)
+  APP_IMAGE         (optional; CI/local build sets this for dev deploys)
+  REGISTRY_NAME     (default: dokr-saas) - DOCR registry name used to mint pull secrets
+  PULL_SECRET_NAME  (default: do-docr-secret)
+EOF
     exit 1
     ;;
 esac
