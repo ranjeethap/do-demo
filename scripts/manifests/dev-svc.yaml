@@ -3,10 +3,13 @@ kind: Service
 metadata:
   name: doks-flask
   namespace: dev
-  labels: { app: doks-flask }
+  labels:
+    app: doks-flask
 spec:
-  selector: { app: doks-flask, role: primary }
+  type: ClusterIP
+  selector:
+    app: doks-flask   # <— only this, no role=primary
   ports:
-    - port: 80
-      targetPort: http
-      name: http
+  - name: http
+    port: 80
+    targetPort: 8080
