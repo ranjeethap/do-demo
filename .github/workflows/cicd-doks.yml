@@ -68,12 +68,22 @@ jobs:
           docker push "${{ steps.img.outputs.image }}:${{ steps.img.outputs.tag_sha }}"
           docker push "${{ steps.img.outputs.image }}:latest"
 
-      - name: Write kubeconfig
+            - name: Write kubeconfig (robust)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+
+          # Try to decode as base64; if that fails, treat the secret as raw kubeconfig
+          if echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d >/dev/null 2>&1; then
+            echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+            echo "Wrote kubeconfig from BASE64 secret."
+          else
+            printf '%s' "${{ secrets.KUBECONFIG_B64 }}" > "$HOME/.kube/config"
+            echo "Wrote kubeconfig from RAW secret."
+          fi
+
+          # Basic sanity check
           kubectl config current-context || true
 
       - name: Ensure namespace and DOCR pull secret
