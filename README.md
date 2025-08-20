@@ -22,18 +22,52 @@ It includes scripts to provision, deploy, promote, and test deployments across `
 ---
 
 ## 📂 Repository Structure
+```
 .
 ├── app/ # Sample Flask app
-│ ├── app.py
-│ ├── Dockerfile
-│ └── requirements.txt
+│ ├── app.py # Application entrypoint
+│ ├── Dockerfile # Dockerfile for the Flask app
+│ └── requirements.txt # Python dependencies
 ├── demo.sh # Main automation script
-├── scripts/ # Supporting scripts (addons, git, cluster ops, hpa, etc.)
-│ ├── manifests/ # Kubernetes manifest templates
+├── demo.sh.org # Backup copy of demo.sh
+├── Dockerfile # (Optional root Dockerfile)
+├── dokr-saas/ # Registry placeholder
+├── doks-flask/ # Deployment placeholder
+├── README-ONECOMMAND.md # Initial readme for one-command setup
 ├── rendered/ # Rendered manifests after demo.sh up
+│ ├── dev-deploy.yaml
+│ ├── dev-hpa.yaml
+│ ├── dev-ingress.yaml
+│ ├── dev-svc.yaml
+│ ├── prod-deploy.tmpl.yaml
+│ ├── prod-ingress.yaml
+│ └── prod-svc.yaml
+├── scripts/ # Supporting scripts (addons, git, cluster ops, HPA, etc.)
+│ ├── addons-helm.sh
+│ ├── ci-local.sh
+│ ├── cluster.sh
+│ ├── demo-canary.sh
+│ ├── demo-rolling.sh
+│ ├── git.sh
+│ ├── hpa-demo.sh
+│ ├── manifests/ # Kubernetes manifest templates
+│ │ ├── dev-deploy.yaml
+│ │ ├── dev-hpa.yaml
+│ │ ├── dev-ingress.yaml
+│ │ ├── dev-svc.yaml
+│ │ ├── prod-deploy.tmpl.yaml
+│ │ ├── prod-ingress.yaml
+│ │ └── prod-svc.yaml
+│ ├── VERSION
+│ └── wait-ready.sh
 ├── docs/ # Extended documentation and guides
-└── VERSION
+│ ├── demo-canary.md
+│ ├── demo-rolling.md
+│ ├── demo-hpa.md
+│ └── demo-hpatroubleshooting.md
+└── VERSION # Version file
 
+```
 
 ---
 
