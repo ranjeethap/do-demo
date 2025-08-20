@@ -78,6 +78,9 @@ It includes scripts to provision, deploy, promote, and test deployments across `
 - Docker (authenticated to DOCR via `doctl registry login`)
 
 ---
+## Architecture
+
+---
 
 ## ⚡ Quick Start
 
@@ -95,8 +98,10 @@ Access URLs (auto-printed):
 
 DEV → http://dev.<ING_ADDR>.sslip.io/
 PROD → http://prod.<ING_ADDR>.sslip.io/
+```
 
-📖 Extended Documentation
+---
+### 📖 Extended Documentation
 
 See the docs/
  folder for detailed walkthroughs:
@@ -110,13 +115,13 @@ HPA Scaling Demo
 
 ---
 
-# 📂 `/docs` folder
+## 📂 `/docs` folder
 
 ### `docs/cluster.md`
 ```markdown
 # Cluster Setup Guide
-
-## 1. Create Kubernetes Cluster
+```
+### 1. Create Kubernetes Cluster
 ```bash
 ./scripts/cluster.sh create
 
@@ -127,38 +132,56 @@ HPA Scaling Demo
 kubectl get svc -n ingress-nginx
 
 The external IP is used for sslip.io DNS.
+```
 
 ---
 
-🧰 CI/CD (GitHub Actions)
-
+### 🧰 CI/CD (GitHub Actions)
+```
 Workflow builds image → pushes to DOCR → deploys to dev → promotes to prod upon manual approval or tag.
-Secrets required:
+```
+---
+### Secrets required:
+```
 DO_TOKEN: DigitalOcean PAT (read/write to registry & cluster)
 DOCR_REGISTRY: e.g., dokr-saas
 DOCR_REPO: e.g., doks-flask
 DO_CLUSTER_NAME: your DOKS cluster name (e.g., doks-saas-cluster)
 Optionally: KUBECONFIG_B64 (if not fetching via doctl)
+```
 
+---
 ### `docs/cicd.md`
 ```markdown
 # CI/CD Workflow
 
 This repository simulates a CI/CD pipeline with **dev → prod promotion**.
+```
+---
 
 ## Workflow
+
+```
 1. Developer pushes code → Docker image built & pushed to DOCR.
 2. `demo.sh up` deploys to DEV namespace.
 3. Once validated, `demo.sh promote` promotes the same image to PROD.
 4. Ingress exposes `dev.*` and `prod.*` URLs.
+```
+
+---
 
 ## Benefits
+```
 - Deterministic promotion (same image tested in dev is promoted to prod).
 - Fast rollback via `kubectl rollout undo`.
 - Separate namespaces ensure isolation.
+```
+---
 
-🧹 Cleanup
+## 🧹 Cleanup
 ./demo.sh down
 
-# Optional: delete cluster (if you created one via scripts/cluster.sh)
+---
+
+## Optional: delete cluster (if you created one via scripts/cluster.sh)
 ./scripts/cluster.sh delete
