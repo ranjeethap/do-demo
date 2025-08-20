@@ -1,0 +1,118 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "DOKS - HPA & CPU (dev/prod)",
+  "timezone": "",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "HPA Current Replicas",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum(kube_horizontalpodautoscaler_status_current_replicas{namespace=\"$namespace\", horizontalpodautoscaler=~\"$hpa\"})",
+          "legendFormat": "current"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "HPA Desired Replicas",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum(kube_horizontalpodautoscaler_status_desired_replicas{namespace=\"$namespace\", horizontalpodautoscaler=~\"$hpa\"})",
+          "legendFormat": "desired"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Deployment Replicas (available vs desired)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "kube_deployment_status_replicas_available{namespace=\"$namespace\", deployment=\"$deployment\"}",
+          "legendFormat": "available"
+        },
+        {
+          "expr": "kube_deployment_spec_replicas{namespace=\"$namespace\", deployment=\"$deployment\"}",
+          "legendFormat": "desired"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "CPU Usage (% of Request) - app containers",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "100 * sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"$namespace\", image!=\"\", pod=~\"$deployment-.*\", container!=\"POD\"}[2m])) / sum by (pod) (kube_pod_container_resource_requests{namespace=\"$namespace\", resource=\"cpu\", pod=~\"$deployment-.*\"})",
+          "legendFormat": "{{pod}}"
+        }
+      ],
+      "yaxes": [
+        { "format": "percent", "min": 0, "max": 300 },
+        { "format": "short" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Pods Ready",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum(kube_pod_status_ready{namespace=\"$namespace\", condition=\"true\", pod=~\"$deployment-.*\"})",
+          "legendFormat": "Ready Pods"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "label": "Namespace",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(kube_pod_info, namespace)",
+        "current": { "text": "dev", "value": "dev" },
+        "options": []
+      },
+      {
+        "name": "deployment",
+        "type": "query",
+        "label": "Deployment",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(kube_deployment_labels{namespace=\"$namespace\"}, deployment)",
+        "current": { "text": "doks-flask", "value": "doks-flask" },
+        "options": []
+      },
+      {
+        "name": "hpa",
+        "type": "query",
+        "label": "HPA",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(kube_horizontalpodautoscaler_labels{namespace=\"$namespace\"}, horizontalpodautoscaler)",
+        "current": { "text": "doks-flask-hpa", "value": "doks-flask-hpa" },
+        "options": []
+      }
+    ]
+  }
+}
