@@ -17,9 +17,9 @@ It includes scripts to provision, deploy, promote, and test deployments across `
   - `promote` → Promote dev image to prod
   - `down` → Cleanup
 - Examples of advanced rollout strategies:
-  - [Canary Deployment](docs/canary.md)
-  - [Rolling Deployment](docs/rolling.md)
-  - [Horizontal Pod Autoscaler](docs/hpa.md)
+  - [Canary Deployment](https://github.com/ranjeethap/do-demo/blob/main/docs/canary.md)
+  - [Rolling Deployment](https://github.com/ranjeethap/do-demo/blob/main/docs/demo-rolling.md)
+  - [Horizontal Pod Autoscaler](https://github.com/ranjeethap/do-demo/blob/main/docs/demo-hpa.md)
 - Ingress with **sslip.io** for zero-config DNS.
 - Helper scripts for cluster bootstrap, helm addons, git automation.
 
@@ -151,13 +151,6 @@ DO_CLUSTER_NAME: your DOKS cluster name (e.g., doks-saas-cluster)
 Optionally: KUBECONFIG_B64 (if not fetching via doctl)
 ```
 
----
-### `docs/cicd.md`
-```markdown
-# CI/CD Workflow
-
-This repository simulates a CI/CD pipeline with **dev → prod promotion**.
-```
 ---
 
 ## Workflow
