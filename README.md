@@ -1,7 +1,11 @@
 # DigitalOcean DOKS Demo Automation
 
 This repository provides a **one-command automation toolkit** for deploying a sample Flask app into **DigitalOcean Kubernetes (DOKS)** with a CI/CD style workflow.  
+
 It includes scripts to provision, deploy, promote, and test deployments across `dev` and `prod` namespaces.
+
+## Architecture
+![Alt text](https://github.com/ranjeethap/do-demo/blob/main/docs/Architecture.png)
 
 ---
 
@@ -76,9 +80,6 @@ It includes scripts to provision, deploy, promote, and test deployments across `
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [helm](https://helm.sh/)
 - Docker (authenticated to DOCR via `doctl registry login`)
-
----
-## Architecture
 
 ---
 
